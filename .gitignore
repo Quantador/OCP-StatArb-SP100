@@ -8,6 +8,9 @@ __pycache__/
 # Jupyter checkpoints (optionnel)
 .ipynb_checkpoints/
 
+# Fichiers de ressources de métadonnées Apple
+._*
+
 # ------------------------------------
 # RÈGLES SPÉCIFIQUES AU DOSSIER DATA
 # ------------------------------------
@@ -17,3 +20,4 @@ data/raw/*
 
 # 2. Ré-inclure (excepter) le fichier .placeholder
 !data/raw/.placeholder
+

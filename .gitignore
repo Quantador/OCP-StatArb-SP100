@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Jupyter checkpoints (optionnel)
+.ipynb_checkpoints/
+
+# ------------------------------------
+# RÈGLES SPÉCIFIQUES AU DOSSIER DATA
+# ------------------------------------
+
+# 1. Ignorer l'intégralité du dossier 'data/raw'
+data/raw/*
+
+# 2. Ré-inclure (excepter) le fichier .placeholder
+!data/raw/.placeholder

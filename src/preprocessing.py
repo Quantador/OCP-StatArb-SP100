@@ -55,6 +55,7 @@ TIMEZONE = "America/New_York"  # timezone for US markets
 
 START_DATE = dt.date(2015, 1, 1)
 END_DATE = dt.date(2017, 3, 31)
+EXPECTED_TRADING_DAYS = 565  # number of NASDAQ trading days between START_DATE and END_DATE without 27-Nov-2015
 
 
 # =============================================================================
@@ -446,7 +447,10 @@ def select_complete_tickers(
     logger.info(f"Selection completed: {len(copied_files)}/{len(files)} files copied to {SELECTED_FOLDER}")
 
 
-def count_tickers_with_expected_rows(expected_rows_per_day: int = 389, expected_days: int = 565):
+def count_tickers_with_expected_rows(
+    expected_rows_per_day: int = EXPECTED_TRADING_DAYS, 
+    expected_days: int = EXPECTED_RETURNS_PER_DAY
+) -> None:
     """
     Count how many tickers in the SELECTED_FOLDER have at least the expected number of rows.
 

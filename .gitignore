@@ -15,9 +15,10 @@ __pycache__/
 # RÈGLES SPÉCIFIQUES AU DOSSIER DATA
 # ------------------------------------
 
-# 1. Ignorer l'intégralité du dossier 'data/raw'
+# 1. Ignorer l'intégralité du dossier 'data/raw' et 'data/extracted'
 data/raw/*
+data/extracted/*
 
-# 2. Ré-inclure (excepter) le fichier .placeholder
+# 2. Ré-inclure (excepter) le fichier .placeholder de raw
 !data/raw/.placeholder
 

@@ -99,7 +99,7 @@ def convert_xltime_to_timestamp(df: pl.DataFrame) -> pl.DataFrame:
         logger.error(msg)
         raise ValueError(msg)
 
-    excel_epoch = datetime.datetime(1899, 12, 30)
+    excel_epoch = dt.datetime(1899, 12, 30)
     micro_per_day = 86_400_000_000  # microseconds per day
 
     ts_expr = (
@@ -446,16 +446,13 @@ def select_complete_tickers(
     logger.info(f"Selection completed: {len(copied_files)}/{len(files)} files copied to {SELECTED_FOLDER}")
 
 
-def count_tickers_with_expected_rows(expected_rows_per_day: int = 389, expected_days: int = 565) -> int:
+def count_tickers_with_expected_rows(expected_rows_per_day: int = 389, expected_days: int = 565):
     """
     Count how many tickers in the SELECTED_FOLDER have at least the expected number of rows.
 
     Args:
         expected_rows_per_day (int): Number of rows expected per trading day (default 389).
         expected_days (int): Number of trading days expected (default 565).
-
-    Returns:
-        int: Number of tickers with enough rows.
     """
     logger.info("Counting rows for each selected ticker...")
 
@@ -478,4 +475,3 @@ def count_tickers_with_expected_rows(expected_rows_per_day: int = 389, expected_
 
     logger.info(f"Number of tickers with the expected number of rows: {num_tickers_with_enough_rows} "
                 f"out of {len(selected_files)}")
-    return num_tickers_with_enough_rows

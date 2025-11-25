@@ -1,12 +1,16 @@
 import os
+import shutil
 import tarfile
+import logging
 from pathlib import Path
 from typing import List
-import polars as pl
-import datetime
-from tqdm.notebook import tqdm
 import datetime as dt
-import logging
+
+import polars as pl
+import pandas as pd
+import pandas_market_calendars as mcal
+from tqdm.notebook import tqdm
+
 
 
 # =============================================================================
@@ -16,16 +20,24 @@ import logging
 LOG_FOLDER = Path("logs")
 LOG_FOLDER.mkdir(exist_ok=True)
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FOLDER / "preprocessing.log", mode="a"),  # log in file
-        logging.StreamHandler()  # also log in console
-    ]
-)
-
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)  # save everything
+
+# Remove existing handlers to avoid duplicates in notebook
+if logger.hasHandlers():
+    logger.handlers.clear()
+
+# File handler: save everything
+file_handler = logging.FileHandler(LOG_FOLDER / "preprocessing.log", mode="a")
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+logger.addHandler(file_handler)
+
+# Stream handler: only show INFO and above
+stream_handler = logging.StreamHandler()
+stream_handler.setLevel(logging.INFO)
+stream_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+logger.addHandler(stream_handler)
 
 
 # =============================================================================
@@ -35,10 +47,14 @@ logger = logging.getLogger(__name__)
 RAW_FOLDER = Path("data/raw/SP100/bbo/")  # original tar archives
 EXTRACTED_FOLDER = Path("data/extracted/SP100/bbo/")  # temporary extraction folder
 PREPROCESSED_FOLDER = Path("data/preprocessed/SP100/bbo/")  # final output parquet
+SELECTED_FOLDER = Path("data/selected/SP100/bbo/")  # selected data for analysis
 
 EXPECTED_MIDPRICES_PER_DAY = 390  # number of minutes in regular trading hours (6.5h * 60)
 EXPECTED_RETURNS_PER_DAY = EXPECTED_MIDPRICES_PER_DAY - 1  # returns are one less than prices
 TIMEZONE = "America/New_York"  # timezone for US markets
+
+START_DATE = dt.date(2015, 1, 1)
+END_DATE = dt.date(2017, 3, 31)
 
 
 # =============================================================================
@@ -356,3 +372,110 @@ def preprocess_all_tickers() -> None:
     logger.info(
         f"{len(successfully)} tickers processed successfully over {len(tickers)} total."
     )
+
+
+def select_complete_tickers(
+    exception_dates: List[pd.Timestamp] = None,
+    delete_exception_days: bool = False
+) -> None:
+    """
+    Select and copy parquet files from PREPROCESSED_FOLDER to SELECTED_FOLDER 
+    that contain all NASDAQ trading days between START_DATE and END_DATE,
+    with the option to delete specific exception dates from the files.
+
+    Args:
+        exception_dates (List[pd.Timestamp], optional): List of dates that are allowed
+            to be missing from the data. Defaults to None.
+        delete_exception_days (bool, optional): If True, remove the exception dates
+            from tickers that contain them. Defaults to False.
+    """
+    logger.info("Starting selection of complete tickers...")
+
+    # Initialize exception dates
+    if exception_dates is None:
+        exception_dates = []
+    exception_dates_set = set([d.date() if isinstance(d, pd.Timestamp) else d for d in exception_dates])
+
+    # Generate NASDAQ trading calendar
+    nasdaq = mcal.get_calendar('NASDAQ')
+    schedule = nasdaq.schedule(start_date=pd.Timestamp(START_DATE),
+                               end_date=pd.Timestamp(END_DATE))
+    trading_days = set([d.date() for d in schedule.index])
+    logger.debug(f"Total trading days: {len(trading_days)}, exception dates: {exception_dates_set}")
+
+    # Adjust trading days by removing exception dates
+    trading_days_to_keep = trading_days - exception_dates_set
+    logger.debug(f"Trading days after removing exceptions: {len(trading_days_to_keep)}")
+
+    # Ensure SELECTED_FOLDER exists and is empty
+    SELECTED_FOLDER.mkdir(parents=True, exist_ok=True)
+    for f in SELECTED_FOLDER.glob("*.parquet"):
+        f.unlink()
+
+    # Loop through all preprocessed parquet files
+    files = list(PREPROCESSED_FOLDER.glob("*.parquet"))
+    copied_files = []
+
+    for f in files:
+        df = pl.read_parquet(f)
+        df_dates = set(df.select(pl.col("timestamp").dt.date().unique()).to_series().to_list())
+
+        # Delete exception dates if requested
+        if delete_exception_days and exception_dates_set & df_dates:
+            df = df.filter(pl.col("timestamp").dt.date().is_in(list(trading_days_to_keep)))
+            logger.debug(f"[{f.name}] Deleted exception dates: {exception_dates_set & df_dates}")
+
+        # Recalculate present dates after optional deletion
+        df_dates_cleaned = set(df.select(pl.col("timestamp").dt.date().unique()).to_series().to_list())
+
+        # Compute missing trading days ignoring exceptions
+        missing_dates = trading_days - df_dates_cleaned - exception_dates_set
+
+        if missing_dates:
+            logger.warning(f"[{f.name}] Missing {len(missing_dates)} trading days: {sorted(missing_dates)}")
+        else:
+            # Save cleaned file if we deleted exception rows, otherwise copy original
+            output_path = SELECTED_FOLDER / f.name
+            if delete_exception_days and exception_dates_set & df_dates:
+                df.write_parquet(output_path)
+            else:
+                shutil.copy(f, output_path)
+            copied_files.append(f.name)
+            logger.debug(f"[{f.name}] Copied to selected folder")
+
+    logger.info(f"Selection completed: {len(copied_files)}/{len(files)} files copied to {SELECTED_FOLDER}")
+
+
+def count_tickers_with_expected_rows(expected_rows_per_day: int = 389, expected_days: int = 565) -> int:
+    """
+    Count how many tickers in the SELECTED_FOLDER have at least the expected number of rows.
+
+    Args:
+        expected_rows_per_day (int): Number of rows expected per trading day (default 389).
+        expected_days (int): Number of trading days expected (default 565).
+
+    Returns:
+        int: Number of tickers with enough rows.
+    """
+    logger.info("Counting rows for each selected ticker...")
+
+    expected_num_rows = expected_rows_per_day * expected_days
+    selected_files = list(SELECTED_FOLDER.glob("*.parquet"))
+    num_tickers_with_enough_rows = 0
+
+    for f in selected_files:
+        try:
+            df = pl.read_parquet(f)
+        except Exception as e:
+            logger.error(f"Error reading {f.name}: {e}")
+            continue
+
+        if df.height >= expected_num_rows:
+            num_tickers_with_enough_rows += 1
+            logger.debug(f"{f.name}: {df.height} rows (meets expected {expected_num_rows})")
+        else:
+            logger.warning(f"{f.name}: {df.height} rows (below expected {expected_num_rows})")
+
+    logger.info(f"Number of tickers with the expected number of rows: {num_tickers_with_enough_rows} "
+                f"out of {len(selected_files)}")
+    return num_tickers_with_enough_rows

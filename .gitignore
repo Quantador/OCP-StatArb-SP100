@@ -19,6 +19,10 @@ __pycache__/
 data/raw/*
 data/extracted/*
 
+checkpoints/*
+
+logs/*
+
 # 2. Ré-inclure (excepter) le fichier .placeholder de raw
 !data/raw/.placeholder
 

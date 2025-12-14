@@ -1,15 +1,17 @@
 import os
 import shutil
 import tarfile
+import itertools
 import logging
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Tuple
 import datetime as dt
 
 import polars as pl
 import pandas as pd
 import pandas_market_calendars as mcal
 from tqdm.notebook import tqdm
+
 
 
 
@@ -479,3 +481,130 @@ def count_tickers_with_expected_rows(
 
     logger.info(f"Number of tickers with the expected number of rows: {num_tickers_with_enough_rows} "
                 f"out of {len(selected_files)}")
+
+
+def get_selected_tickers() -> List[str]:
+    """
+    List all tickers that have a selected parquet file in SELECTED_FOLDER.
+
+    Returns:
+        List[str]: Sorted list of ticker symbols (without .parquet).
+    """
+    tickers = []
+    for f in SELECTED_FOLDER.glob("*.parquet"):
+        # e.g. "AAPL.parquet" -> "AAPL"
+        tickers.append(f.stem)
+    tickers = sorted(tickers)
+    logger.info(f"Found {len(tickers)} selected tickers.")
+    return tickers
+
+
+def load_selected_ticker_frames() -> Dict[str, pl.DataFrame]:
+    """
+    Load all selected tickers into memory as a dict: ticker -> DataFrame(timestamp, mid_price_return).
+
+    Returns:
+        Dict[str, pl.DataFrame]: One DataFrame per ticker, aligned on its own timestamp grid.
+    """
+    frames: Dict[str, pl.DataFrame] = {}
+
+    for f in SELECTED_FOLDER.glob("*.parquet"):
+        ticker = f.stem
+        try:
+            df = pl.read_parquet(f)
+        except Exception as e:
+            logger.error(f"[{ticker}] Error reading selected parquet: {e}")
+            continue
+
+        # Expect at least columns: timestamp, mid_price_return
+        if not {"timestamp", "mid_price_return"}.issubset(df.columns):
+            logger.warning(f"[{ticker}] Missing expected columns, skipping.")
+            continue
+
+        # Enforce dtypes and sort
+        df = (
+            df
+            .with_columns(pl.col("timestamp").cast(pl.Datetime(time_zone=TIMEZONE)))
+            .sort("timestamp")
+            .select(["timestamp", "mid_price_return"])
+        )
+
+        frames[ticker] = df
+        logger.debug(f"[{ticker}] Loaded {df.height} rows from selected data.")
+
+    logger.info(f"Loaded {len(frames)} selected ticker frames into memory.")
+    return frames
+
+def build_returns_panel(frames: Dict[str, pl.DataFrame]) -> pl.DataFrame:
+    """
+    Build a wide returns panel from per-ticker DataFrames.
+
+    The result has:
+        - one row per timestamp
+        - one column per ticker containing its mid_price_return
+
+    Assumes that all frames cover (almost) the same timestamp grid; any
+    residual misalignment will show up as nulls, which you can handle
+    downstream (e.g., drop rows with any nulls).
+
+    Args:
+        frames (Dict[str, pl.DataFrame]): Mapping ticker -> DataFrame(timestamp, mid_price_return).
+
+    Returns:
+        pl.DataFrame: Wide panel with columns ['timestamp', <ticker1>, <ticker2>, ...].
+    """
+    if not frames:
+        logger.warning("No frames provided to build_returns_panel; returning empty DataFrame.")
+        return pl.DataFrame()
+
+    # Stack all tickers vertically, then pivot to wide format
+    stacked = []
+    for ticker, df in frames.items():
+        stacked.append(
+            df.with_columns(
+                pl.lit(ticker).alias("ticker")
+            )
+        )
+
+    all_data = pl.concat(stacked, how="vertical")
+
+    panel = (
+        all_data
+        .pivot(
+            values="mid_price_return",
+            index="timestamp",
+            columns="ticker"
+        )
+        .sort("timestamp")
+    )
+
+    logger.info(
+        f"Returns panel built: {panel.height} rows x {len(panel.columns) - 1} tickers "
+        f"(+1 timestamp column)."
+    )
+
+    # Optional: sanity checks on nulls
+    null_counts = panel.null_count()
+    total_nulls = int(sum(null_counts.select(pl.all().sum()).row(0)))
+    if total_nulls > 0:
+        logger.warning(
+            f"Returns panel contains {total_nulls} null entries. "
+            "Consider dropping or imputing rows with nulls before OCP."
+        )
+
+    return panel
+
+
+def generate_ticker_pairs(tickers: List[str]) -> List[Tuple[str, str]]:
+    """
+    Generate all unordered ticker pairs from a list of tickers.
+
+    Args:
+        tickers (List[str]): List of ticker symbols.
+
+    Returns:
+        List[Tuple[str, str]]: List of (ticker_i, ticker_j) with i < j.
+    """
+    pairs = list(itertools.combinations(sorted(tickers), 2))
+    logger.info(f"Generated {len(pairs)} ticker pairs from {len(tickers)} tickers.")
+    return pairs

@@ -1,771 +1,614 @@
-# ocp.py
-from __future__ import annotations
-
-import itertools
-import json
-import logging
-import os
+import numpy as np
+import pandas as pd
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-
-import numpy as np
-import polars as pl
-
-
-# ============================================================
-# Logging
-# ============================================================
-
-logger = logging.getLogger("ocp")
-if not logger.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-    logger.addHandler(_h)
-logger.setLevel(logging.INFO)
+from collections import defaultdict
+from itertools import combinations
+from typing import List, Tuple, Dict, Optional
+from tqdm import tqdm
+import numba as nb
 
 
-# ============================================================
-# Data structures
-# ============================================================
-
-@dataclass(frozen=True)
-class WindowStats:
-    rows_before: int
-    rows_after: int
-    dropped_rows: int
-    tickers_before: int
-    tickers_after: int
-    coverage_threshold: float
 
 
 @dataclass(frozen=True)
 class OCPResult:
-    formation_date: str  # YYYY-MM-DD
     leader: str
     follower: str
-    lag_initial: int
-    lag_hat: float
-    sigma_lag: float
+    l_hat: float
+    sigma_l: float
     cost: float
     path_len: int
-    band: int
-    window_rows_used: int
 
 
-# ============================================================
-# Helpers: pairs + array checks
-# ============================================================
-
-def generate_ticker_pairs(tickers: Sequence[str]) -> List[Tuple[str, str]]:
-    """All unordered pairs (i<j)."""
-    return list(itertools.combinations(sorted(tickers), 2))
-
-
-def _ensure_1d_float(a: np.ndarray) -> np.ndarray:
-    a = np.asarray(a)
-    if a.ndim != 1:
-        raise ValueError(f"Expected 1D array, got shape {a.shape}")
-    return a.astype(np.float64, copy=False)
-
-
-# ============================================================
-# Daily boundaries
-# ============================================================
-
-def build_trading_days(panel: pl.DataFrame) -> pl.DataFrame:
+def build_daily_return_matrices(
+    data_dir: Path,
+    ticker_list: list[str],
+    timestamp_col: str = "timestamp",
+    return_col: str = "return"
+):
     """
-    Return a DataFrame with one row per date:
-      columns: date (Date), start_ts (Datetime), end_ts (Datetime), n_rows (int)
-
-    Assumes panel has a 'timestamp' column.
-    """
-    if "timestamp" not in panel.columns:
-        raise ValueError("panel must contain a 'timestamp' column")
-
-    days = (
-        panel
-        .select(pl.col("timestamp"))
-        .sort("timestamp")
-        .with_columns(pl.col("timestamp").dt.date().alias("date"))
-        .group_by("date")
-        .agg([
-            pl.col("timestamp").min().alias("start_ts"),
-            pl.col("timestamp").max().alias("end_ts"),
-            pl.len().alias("n_rows"),
-        ])
-        .sort("date")
-    )
-    return days
-
-
-# ============================================================
-# Formation window preparation (coverage filter + dense rows)
-# ============================================================
-
-def prepare_formation_window(
-    panel: pl.DataFrame,
-    tickers: List[str],
-    start_ts,
-    end_ts,
-    coverage_threshold: float = 0.99,
-    min_tickers: int = 20,
-    min_rows: int = 300,
-) -> Tuple[pl.DataFrame, List[str], WindowStats]:
-    """
-    Prepare a dense formation window for OCP:
-
-    - slice panel to [start_ts, end_ts)
-    - compute per-ticker coverage over the slice
-    - keep tickers with coverage >= coverage_threshold
-    - drop any rows with nulls in any kept ticker
-
     Returns:
-      dense_window_panel (timestamp + kept tickers),
-      kept_tickers,
-      stats
-
-    Raises ValueError if too few tickers or rows remain.
+        dict[date -> pd.DataFrame]
+        Each DataFrame:
+            index   = minute timestamps
+            columns = tickers
+            values  = minute returns
     """
-    if "timestamp" not in panel.columns:
-        raise ValueError("Panel must contain a 'timestamp' column.")
 
-    missing_cols = [t for t in tickers if t not in panel.columns]
-    if missing_cols:
-        raise ValueError(
-            f"Panel missing ticker columns: {missing_cols[:10]}"
-            f"{'...' if len(missing_cols) > 10 else ''}"
-        )
+    # Load all tickers into memory (acceptable at this scale)
+    ticker_data = {}
+    for ticker in ticker_list:
+        df = pd.read_parquet(data_dir / f"{ticker}.parquet")
+        df[timestamp_col] = pd.to_datetime(df[timestamp_col])
+        df["date"] = df[timestamp_col].dt.date
+        ticker_data[ticker] = df
 
-    w = (
-        panel
-        .filter((pl.col("timestamp") >= start_ts) & (pl.col("timestamp") < end_ts))
-        .select(["timestamp"] + tickers)
-        .sort("timestamp")
-    )
+    # Group data by day
+    daily_frames = defaultdict(list)
 
-    rows_before = w.height
-    if rows_before == 0:
-        raise ValueError("Formation window slice is empty.")
+    for ticker, df in ticker_data.items():
+        for date, day_df in df.groupby("date"):
+            day_df = day_df.set_index(timestamp_col)[[return_col]]
+            day_df.columns = [ticker]
+            daily_frames[date].append(day_df)
 
-    # Compute null counts per ticker (one row DataFrame -> tuple)
-    null_counts = w.select([pl.col(t).null_count().alias(t) for t in tickers]).row(0)
+    # Build final matrices
+    daily_matrices = {}
+    for date, frames in daily_frames.items():
+        # Inner join → keeps only tickers with full minute coverage
+        day_matrix = pd.concat(frames, axis=1, join="inner")
 
-    kept: List[str] = []
-    for t, nc in zip(tickers, null_counts):
-        coverage = 1.0 - float(nc) / float(rows_before)
-        if coverage >= coverage_threshold:
-            kept.append(t)
+        # Skip days with fewer than 2 tickers
+        if day_matrix.shape[1] < 2:
+            continue
 
-    if len(kept) < min_tickers:
-        raise ValueError(f"Too few tickers after coverage filtering ({len(kept)} < {min_tickers}).")
+        daily_matrices[date] = day_matrix.sort_index()
 
-    w_dense = w.select(["timestamp"] + kept).drop_nulls(subset=kept)
-    rows_after = w_dense.height
-
-    if rows_after < min_rows:
-        raise ValueError(f"Too few rows after dropping nulls ({rows_after} < {min_rows}).")
-
-    stats = WindowStats(
-        rows_before=rows_before,
-        rows_after=rows_after,
-        dropped_rows=rows_before - rows_after,
-        tickers_before=len(tickers),
-        tickers_after=len(kept),
-        coverage_threshold=float(coverage_threshold),
-    )
-    return w_dense, kept, stats
+    return daily_matrices
 
 
-def extract_arrays_from_window(window_panel: pl.DataFrame, tickers: List[str]) -> Dict[str, np.ndarray]:
-    """Convert a dense window panel into numpy arrays per ticker."""
-    out: Dict[str, np.ndarray] = {}
-    for t in tickers:
-        out[t] = window_panel.get_column(t).to_numpy().astype(np.float64, copy=False)
-    return out
-
-
-# ============================================================
-# Pair prefilter (fast): absolute correlation
-# ============================================================
-
-def prefilter_pairs_by_abs_corr(
-    window_panel_dense: pl.DataFrame,
-    tickers: List[str],
-    max_pairs: int = 500,
-) -> List[Tuple[str, str]]:
+def build_daily_pairs(daily_matrices):
     """
-    Reduce compute by keeping only max_pairs pairs with highest |corr|
-    computed on the dense formation window.
+    Returns:
+        dict[date -> list[tuple[str, str]]]
     """
-    if max_pairs <= 0:
-        return generate_ticker_pairs(tickers)
 
-    X = window_panel_dense.select(tickers).to_numpy()
-    C = np.corrcoef(X, rowvar=False)
+    daily_pairs = {}
 
-    n = C.shape[0]
-    scored: List[Tuple[float, int, int]] = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            s = abs(C[i, j])
-            if np.isfinite(s):
-                scored.append((s, i, j))
+    for date, matrix in daily_matrices.items():
+        tickers = matrix.columns.tolist()
+        pairs = list(combinations(tickers, 2))
+        daily_pairs[date] = pairs
 
-    scored.sort(reverse=True, key=lambda z: z[0])
-    scored = scored[: min(max_pairs, len(scored))]
-
-    return [(tickers[i], tickers[j]) for _, i, j in scored]
+    return daily_pairs
 
 
-# ============================================================
-# OCP Step A: constant lag
-# ============================================================
+def prefilter_pairs_by_xcorr(
+    day_matrix,            # pd.DataFrame (minutes x tickers)
+    max_lag=30,
+    keep_top_k=400,        # tune: 200-800
+    min_abs_xcorr=0.05     # safety floor
+):
+    X = day_matrix.to_numpy(dtype=np.float64)  # shape (T, N)
+    tickers = day_matrix.columns.to_list()
+    T, N = X.shape
 
-def ocp_step_a_constant_lag(x: np.ndarray, y: np.ndarray, max_lag: Optional[int] = None) -> int:
+    # z-score each ticker (avoid scale issues)
+    X = X - X.mean(axis=0, keepdims=True)
+    std = X.std(axis=0, keepdims=True) + 1e-12
+    X = X / std
+
+    scores = []
+    for i, j in combinations(range(N), 2):
+        xi, xj = X[:, i], X[:, j]
+        best = 0.0
+        # leader i -> follower j corresponds to corr(xi[t], xj[t+lag])
+        for lag in range(1, max_lag + 1):
+            a = xi[:-lag]
+            b = xj[lag:]
+            c1 = float(np.mean(a * b))
+            # also check opposite direction in the score (we’ll decide direction later)
+            a2 = xj[:-lag]
+            b2 = xi[lag:]
+            c2 = float(np.mean(a2 * b2))
+            best = max(best, abs(c1), abs(c2))
+        if best >= min_abs_xcorr:
+            scores.append((best, tickers[i], tickers[j]))
+
+    if not scores:
+        return []
+
+    scores.sort(reverse=True, key=lambda x: x[0])
+    scores = scores[:keep_top_k]
+    
+    return [(a, b) for _, a, b in scores]
+
+
+
+def _step_a_constant_lag(x: np.ndarray, y: np.ndarray, max_lag: int) -> int:
     """
-    Choose lag l >= 0 minimizing sum_{i=1..M} |x_{i+l} - y_i|, requiring N>=M.
+    Step A: Find initial lag l in [0, max_lag] minimizing sum_i |x[i+l] - y[i]|.
+    We assume x is potentially the leader (shifted forward) and y the follower.
     """
-    x = _ensure_1d_float(x)
-    y = _ensure_1d_float(y)
-    N, M = len(x), len(y)
-
-    if N < M:
-        raise ValueError(f"Step A expects N >= M (got N={N}, M={M}).")
-
-    Lmax = N - M
-    if max_lag is not None:
-        Lmax = min(Lmax, int(max_lag))
-    Lmax = max(Lmax, 0)
+    n = len(x)
+    m = len(y)
+    L = min(max_lag, max(0, n - m))
+    if m == 0 or n == 0:
+        return 0
+    if L == 0:
+        return 0
 
     best_l = 0
     best_cost = np.inf
 
-    for l in range(Lmax + 1):
-        xs = x[l:l + M]
-        mask = np.isfinite(xs) & np.isfinite(y)
-        if not np.any(mask):
-            continue
-        cost = float(np.sum(np.abs(xs[mask] - y[mask])))
-        if cost < best_cost:
-            best_cost = cost
+    # Compare y[0:m] with x[l:l+m]
+    for l in range(L + 1):
+        seg = x[l:l + m]
+        if len(seg) != m:
+            break
+        c = np.sum(np.abs(seg - y))
+        if c < best_cost:
+            best_cost = c
             best_l = l
 
-    return int(best_l)
+    return best_l
 
 
-# ============================================================
-# OCP Step B: banded dynamic programming path
-# ============================================================
+def step_a_constant_lag_fast(x, y, max_lag):
+    n, m = len(x), len(y)
+    L = min(max_lag, max(0, n - m))
+    if L <= 0:
+        return 0
 
-def ocp_step_b_optimal_path(
+    # Build a (L+1, m) view: x[l:l+m] for l=0..L
+    # Using stride trick to avoid copies
+    stride = x.strides[0]
+    Xwin = np.lib.stride_tricks.as_strided(
+        x, shape=(L + 1, m), strides=(stride, stride)
+    )
+    costs = np.sum(np.abs(Xwin - y[None, :]), axis=1)
+    return int(np.argmin(costs))
+
+
+@nb.njit
+def ocp_banded_dp_stats(x, y, l_init, band):
+    n = x.shape[0]
+    m = y.shape[0]
+    INF = 1e30
+
+    # banded indexing: for each i, allowed j in [j0, j1]
+    # center: j ~= i - l_init
+    width = 2 * band + 1
+
+    # dp rolling rows
+    prev = np.full(width, INF)
+    curr = np.full(width, INF)
+
+    # store parent moves for backtracking: 0=diag,1=up,2=left
+    # store only for valid band cells
+    parent = np.full((n, width), 255, dtype=np.uint8)
+
+    # helper to map (i,j) -> band index k
+    # j_center = i - l_init, k = j - (j_center - band)
+    for i in range(n):
+        j_center = i - l_init
+        j_min = j_center - band
+        j_max = j_center + band
+
+        # reset current row
+        for k in range(width):
+            curr[k] = INF
+
+        for j in range(max(0, j_min), min(m - 1, j_max) + 1):
+            k = j - j_min  # band index
+            c = abs(x[i] - y[j])
+
+            if i == 0 and j == 0:
+                curr[k] = c
+                parent[i, k] = 0
+                continue
+
+            best = INF
+            move = 255
+
+            # from up: (i-1, j) => prev row, band index depends on i-1
+            if i > 0:
+                j_min_prev = (i - 1 - l_init) - band
+                k_up = j - j_min_prev
+                if 0 <= k_up < width:
+                    val = prev[k_up]
+                    if val < best:
+                        best = val
+                        move = 1  # up
+
+            # from left: (i, j-1) => same row, k-1
+            if j > 0 and k - 1 >= 0:
+                val = curr[k - 1]
+                if val < best:
+                    best = val
+                    move = 2  # left
+
+            # from diag: (i-1, j-1)
+            if i > 0 and j > 0:
+                j_min_prev = (i - 1 - l_init) - band
+                k_diag = (j - 1) - j_min_prev
+                if 0 <= k_diag < width:
+                    val = prev[k_diag]
+                    if val < best:
+                        best = val
+                        move = 0  # diag
+
+            if move != 255:
+                curr[k] = best + c
+                parent[i, k] = move
+
+        # roll rows
+        prev, curr = curr, prev
+
+    # Backtrack from (n-1, m-1) if it is in band of last row
+    i = n - 1
+    j_center = i - l_init
+    j_min = j_center - band
+    k = (m - 1) - j_min
+    if k < 0 or k >= width:
+        return INF, 0.0, 1e30  # unreachable
+
+    total_cost = prev[k]
+    if total_cost >= INF / 2:
+        return INF, 0.0, 1e30
+
+    # backtrack lag stats
+    count = 0
+    sum_d = 0.0
+    sum_d2 = 0.0
+
+    j = m - 1
+    while True:
+        d = i - j
+        count += 1
+        sum_d += d
+        sum_d2 += d * d
+
+        move = parent[i, k]
+        if i == 0 and j == 0:
+            break
+
+        if move == 0:  # diag
+            i -= 1
+            j -= 1
+        elif move == 1:  # up
+            i -= 1
+        else:  # left
+            j -= 1
+
+        j_center = i - l_init
+        j_min = j_center - band
+        k = j - j_min
+        if k < 0 or k >= width:
+            return INF, 0.0, 1e30
+
+    l_hat = sum_d / count
+    var = (sum_d2 / count) - l_hat * l_hat
+    if var < 0.0:
+        var = 0.0
+    sigma = np.sqrt(var)
+    return total_cost, l_hat, sigma
+
+
+def _step_b_optimal_path_cost_and_backtrack(
     x: np.ndarray,
     y: np.ndarray,
+    l_init: int,
     band: int,
-    max_cells: int = 25_000_000,
-) -> Tuple[np.ndarray, float]:
+) -> Tuple[float, List[Tuple[int, int]]]:
     """
-    Banded DP for optimal causal path with moves:
-      (1,0), (0,1), (1,1)
+    Step B: Dynamic programming for minimal cost path with moves:
+      (i-1,j), (i,j-1), (i-1,j-1)
+    Cost per cell: |x[i] - y[j]|
 
-    Only compute cells where |n - m| <= band.
+    We constrain computation to a Sakoe-Chiba-like band around the diagonal
+    shifted by l_init: i ≈ j + l_init  within +/- band.
 
     Returns:
-      path (I,2) with indices (n,m),
-      total_cost (sum |x[n]-y[m]| over path)
+      total_cost, path as list of (i, j) indices (0-based), from (0,0) to (n-1,m-1)
     """
-    x = _ensure_1d_float(x)
-    y = _ensure_1d_float(y)
+    n, m = len(x), len(y)
+    if n == 0 or m == 0:
+        return np.inf, []
 
-    N, M = len(x), len(y)
-    if N == 0 or M == 0:
-        raise ValueError("Empty series passed to Step B.")
-    if band <= 0:
-        raise ValueError("band must be a positive integer (e.g. 20..60).")
+    # DP arrays
+    INF = 1e30
+    dp = np.full((n, m), INF, dtype=np.float64)
+    parent = np.full((n, m, 2), -1, dtype=np.int32)  # store predecessor (pi, pj)
 
-    approx_cells = (2 * band + 1) * max(N, M)
-    if approx_cells > max_cells:
-        raise MemoryError(
-            f"Refusing DP: approx_cells={approx_cells:,} exceeds max_cells={max_cells:,}. "
-            f"Use smaller windows and/or a smaller band."
-        )
+    def in_band(i: int, j: int) -> bool:
+        # i close to j + l_init
+        return abs(i - (j + l_init)) <= band
 
-    dp = np.full((N, M), np.inf, dtype=np.float64)
-    prev = np.full((N, M, 2), -1, dtype=np.int32)
+    # Initialize
+    for i in range(n):
+        # For each i, compute allowed j range
+        j_center = i - l_init
+        j_min = max(0, j_center - band)
+        j_max = min(m - 1, j_center + band)
+        for j in range(j_min, j_max + 1):
+            c = abs(x[i] - y[j])
 
-    def in_band(n: int, m: int) -> bool:
-        return abs(n - m) <= band
-
-    for n in range(N):
-        m_start = max(0, n - band)
-        m_end = min(M - 1, n + band)
-
-        xn = x[n]
-        for m in range(m_start, m_end + 1):
-            ym = y[m]
-            if not (np.isfinite(xn) and np.isfinite(ym)):
-                continue
-            c = abs(xn - ym)
-
-            if n == 0 and m == 0:
-                dp[n, m] = c
-                prev[n, m] = (-1, -1)
+            if i == 0 and j == 0:
+                dp[i, j] = c
+                parent[i, j] = (-1, -1)
                 continue
 
-            best_val = np.inf
-            best_prev = (-1, -1)
+            best_prev = INF
+            best_pi, best_pj = -1, -1
 
-            # from (n-1, m)
-            if n - 1 >= 0 and in_band(n - 1, m):
-                v = dp[n - 1, m]
-                if v < best_val:
-                    best_val = v
-                    best_prev = (n - 1, m)
+            # (i-1, j)
+            if i > 0 and in_band(i - 1, j) and dp[i - 1, j] < best_prev:
+                best_prev = dp[i - 1, j]
+                best_pi, best_pj = i - 1, j
 
-            # from (n, m-1)
-            if m - 1 >= 0 and in_band(n, m - 1):
-                v = dp[n, m - 1]
-                if v < best_val:
-                    best_val = v
-                    best_prev = (n, m - 1)
+            # (i, j-1)
+            if j > 0 and in_band(i, j - 1) and dp[i, j - 1] < best_prev:
+                best_prev = dp[i, j - 1]
+                best_pi, best_pj = i, j - 1
 
-            # from (n-1, m-1)
-            if n - 1 >= 0 and m - 1 >= 0 and in_band(n - 1, m - 1):
-                v = dp[n - 1, m - 1]
-                if v < best_val:
-                    best_val = v
-                    best_prev = (n - 1, m - 1)
+            # (i-1, j-1)
+            if i > 0 and j > 0 and in_band(i - 1, j - 1) and dp[i - 1, j - 1] < best_prev:
+                best_prev = dp[i - 1, j - 1]
+                best_pi, best_pj = i - 1, j - 1
 
-            if np.isfinite(best_val):
-                dp[n, m] = best_val + c
-                prev[n, m] = best_prev
+            if best_prev < INF:
+                dp[i, j] = best_prev + c
+                parent[i, j] = (best_pi, best_pj)
 
-    if not np.isfinite(dp[N - 1, M - 1]):
-        raise RuntimeError("No valid DP path found (band too tight or too many invalid values).")
+    total_cost = dp[n - 1, m - 1]
+    if not np.isfinite(total_cost) or total_cost >= INF / 2:
+        return np.inf, []
 
     # Backtrack
-    path_rev: List[Tuple[int, int]] = []
-    n, m = N - 1, M - 1
-    while n >= 0 and m >= 0:
-        path_rev.append((n, m))
-        pn, pm = prev[n, m]
-        if pn == -1 and pm == -1:
+    path = []
+    i, j = n - 1, m - 1
+    while i >= 0 and j >= 0:
+        path.append((i, j))
+        pi, pj = parent[i, j]
+        if pi == -1 and pj == -1:
             break
-        n, m = int(pn), int(pm)
+        i, j = int(pi), int(pj)
 
-    path = np.array(path_rev[::-1], dtype=np.int32)
-    total_cost = float(dp[N - 1, M - 1])
-    return path, total_cost
+    path.reverse()
+    return float(total_cost), path
 
 
-# ============================================================
-# OCP Step C: lag stats
-# ============================================================
-
-def ocp_step_c_lag_stats(path: np.ndarray) -> Tuple[float, float]:
+def _step_c_lag_stats(path: List[Tuple[int, int]]) -> Tuple[float, float]:
     """
-    lag_i = n_i - m_i
-    lag_hat = mean(lag_i)
-    sigma_lag = sqrt(mean((lag_i - lag_hat)^2))
+    Step C: l_hat = mean(i - j), sigma_l = std(i - j) over the path points.
     """
-    if path.ndim != 2 or path.shape[1] != 2:
-        raise ValueError(f"Expected path shape (I,2), got {path.shape}")
-    lags = path[:, 0].astype(np.float64) - path[:, 1].astype(np.float64)
-    lag_hat = float(np.mean(lags))
-    sigma_lag = float(np.sqrt(np.mean((lags - lag_hat) ** 2)))
-    return lag_hat, sigma_lag
+    if not path:
+        return 0.0, np.inf
+    diffs = np.array([i - j for (i, j) in path], dtype=np.float64)
+    l_hat = float(np.mean(diffs))
+    sigma_l = float(np.std(diffs, ddof=0))
+    return l_hat, sigma_l
 
 
-# ============================================================
-# OCP for one pair (directed) and direction selection
-# ============================================================
-
-def ocp_run_directed_pair(
-    x: np.ndarray,
-    y: np.ndarray,
-    band: int,
-    max_lag_step_a: Optional[int] = None,
-) -> Tuple[int, float, float, float, int]:
+def ocp_pair(
+    day_matrix: pd.DataFrame,
+    pair: Tuple[str, str],
+    max_lag: int = 30,
+    band: int = 10,
+    min_abs_lag: float = 1.0,
+    max_sigma: float = 50.0,
+):
     """
-    Run Step A/B/C for x->y direction.
-    Returns: (lag_initial, lag_hat, sigma_lag, cost, path_len)
+    Runs OCP (A,B,C) for one pair on a given day_matrix (minutes x tickers returns).
+
+    Convention:
+      We try both orientations:
+        x leads y (positive lag) and y leads x
+      and keep the one with smaller sigma_l among valid results.
+
+    Valid result filters:
+      |l_hat| >= min_abs_lag
+      sigma_l <= max_sigma
     """
-    x = _ensure_1d_float(x)
-    y = _ensure_1d_float(y)
+    a, b = pair
+    xa = day_matrix[a].to_numpy(dtype=np.float64)
+    xb = day_matrix[b].to_numpy(dtype=np.float64)
 
-    L = min(len(x), len(y))
-    if L == 0:
-        raise ValueError("Empty arrays for pair.")
-    x = x[:L]
-    y = y[:L]
+    def run_orientation(x_name, y_name, x, y):
+        l_init = _step_a_constant_lag(x, y, max_lag=max_lag)
+        cost, path = _step_b_optimal_path_cost_and_backtrack(x, y, l_init=l_init, band=band)
+        if not np.isfinite(cost) or not path:
+            return None
+        l_hat, sigma_l = _step_c_lag_stats(path)
 
-    lag_initial = ocp_step_a_constant_lag(x, y, max_lag=max_lag_step_a)
-    path, cost = ocp_step_b_optimal_path(x, y, band=band)
-    lag_hat, sigma_lag = ocp_step_c_lag_stats(path)
+        # In this orientation, "x leads y" corresponds to l_hat > 0 typically.
+        # We enforce leader/follower using sign of l_hat.
+        if abs(l_hat) < min_abs_lag or sigma_l > max_sigma:
+            return None
 
-    return int(lag_initial), float(lag_hat), float(sigma_lag), float(cost), int(path.shape[0])
+        if l_hat > 0:
+            leader, follower = x_name, y_name
+        else:
+            leader, follower = y_name, x_name  # if negative, it implies y leads x under our convention
+
+        return OCPResult(
+            leader=leader,
+            follower=follower,
+            l_hat=l_hat,
+            sigma_l=sigma_l,
+            cost=cost,
+            path_len=len(path),
+        )
+
+    r1 = run_orientation(a, b, xa, xb)
+    r2 = run_orientation(b, a, xb, xa)
+
+    if r1 is None and r2 is None:
+        return None
+    if r1 is None:
+        return r2
+    if r2 is None:
+        return r1
+
+    # Choose the more "stable" (lower sigma_l); tie-breaker: lower cost
+    if r1.sigma_l < r2.sigma_l:
+        return r1
+    if r2.sigma_l < r1.sigma_l:
+        return r2
+    return r1 if r1.cost <= r2.cost else r2
 
 
-def choose_direction_by_stability(
-    xa: np.ndarray,
-    xb: np.ndarray,
-    a: str,
-    b: str,
-    band: int,
-    max_lag_step_a: Optional[int] = None,
-) -> Tuple[str, str, int, float, float, float, int]:
-    """
-    Run both a->b and b->a, keep the one with smaller sigma_lag.
-    Returns: leader, follower, lag_initial, lag_hat, sigma_lag, cost, path_len
-    """
-    r_ab = ocp_run_directed_pair(xa, xb, band=band, max_lag_step_a=max_lag_step_a)
-    r_ba = ocp_run_directed_pair(xb, xa, band=band, max_lag_step_a=max_lag_step_a)
+def ocp_pair_fast(day_matrix, pair, max_lag=30, band=10, min_abs_lag=1.0, max_sigma=50.0):
+    a, b = pair
+    xa = day_matrix[a].to_numpy(np.float64)
+    xb = day_matrix[b].to_numpy(np.float64)
 
-    if r_ab[2] <= r_ba[2]:
-        lag_initial, lag_hat, sigma_lag, cost, path_len = r_ab
-        return a, b, lag_initial, lag_hat, sigma_lag, cost, path_len
-    else:
-        lag_initial, lag_hat, sigma_lag, cost, path_len = r_ba
-        return b, a, lag_initial, lag_hat, sigma_lag, cost, path_len
+    # Try orientation a->b
+    l0 = step_a_constant_lag_fast(xa, xb, max_lag=max_lag)
+    cost1, lhat1, sig1 = ocp_banded_dp_stats(xa, xb, l0, band)
+
+    best = None
+    if np.isfinite(cost1) and abs(lhat1) >= min_abs_lag and sig1 <= max_sigma:
+        leader, follower = (a, b) if lhat1 > 0 else (b, a)
+        best = (leader, follower, float(lhat1), float(sig1), float(cost1))
+
+    # Try orientation b->a
+    l0 = step_a_constant_lag_fast(xb, xa, max_lag=max_lag)
+    cost2, lhat2, sig2 = ocp_banded_dp_stats(xb, xa, l0, band)
+
+    cand = None
+    if np.isfinite(cost2) and abs(lhat2) >= min_abs_lag and sig2 <= max_sigma:
+        leader, follower = (b, a) if lhat2 > 0 else (a, b)
+        cand = (leader, follower, float(lhat2), float(sig2), float(cost2))
+
+    if best is None:
+        return cand
+    if cand is None:
+        return best
+
+    # choose lower sigma, then lower cost
+    if cand[3] < best[3]:
+        return cand
+    if cand[3] > best[3]:
+        return best
+    return cand if cand[4] < best[4] else best
 
 
-# ============================================================
-# Run OCP on many pairs for one formation window
-# ============================================================
+# -------------------------
+# Daily runner: top-K pairs
+# -------------------------
 
-def run_ocp_on_pairs(
-    arrays_by_ticker: Dict[str, np.ndarray],
-    pairs: Iterable[Tuple[str, str]],
-    formation_date: str,
-    band: int,
+def ocp_top_pairs_for_day(
+    day_matrix: pd.DataFrame,
+    day_pairs: List[Tuple[str, str]],
+    keep_top_pairs: int = 400,
     top_k: int = 10,
-    require_nonzero_lag: bool = True,
-    max_lag_step_a: Optional[int] = None,
-    window_rows_used: Optional[int] = None,
-) -> List[OCPResult]:
+    max_lag: int = 30,
+    band: int = 10,
+    min_abs_lag: float = 1.0,
+    max_sigma: float = 50.0,
+) -> pd.DataFrame:
+    """
+    Runs OCP on all pairs for a single formation day and returns top_k results
+    sorted by sigma_l asc (then cost asc).
+    """
+    
+    pairs = prefilter_pairs_by_xcorr(
+        day_matrix=day_matrix,
+        max_lag=max_lag,
+        keep_top_k=keep_top_pairs,
+        min_abs_xcorr=0.05
+    )
+    
     results: List[OCPResult] = []
 
-    for a, b in pairs:
-        xa = arrays_by_ticker[a]
-        xb = arrays_by_ticker[b]
-
-        leader, follower, lag_initial, lag_hat, sigma_lag, cost, path_len = choose_direction_by_stability(
-            xa, xb, a, b, band=band, max_lag_step_a=max_lag_step_a
-        )
-
-        if require_nonzero_lag and abs(lag_hat) < 1e-12:
-            continue
-
-        results.append(
-            OCPResult(
-                formation_date=formation_date,
-                leader=leader,
-                follower=follower,
-                lag_initial=lag_initial,
-                lag_hat=lag_hat,
-                sigma_lag=sigma_lag,
-                cost=cost,
-                path_len=path_len,
-                band=int(band),
-                window_rows_used=int(window_rows_used) if window_rows_used is not None else -1,
-            )
-        )
-
-    results.sort(key=lambda r: r.sigma_lag)
-    return results[:top_k]
-
-
-# ============================================================
-# Checkpointing
-# ============================================================
-
-def _run_signature(
-    coverage_threshold: float,
-    min_tickers: int,
-    min_rows_per_day: int,
-    min_rows_after_clean: int,
-    band: int,
-    top_k: int,
-    max_pairs_prefilter: int,
-    require_nonzero_lag: bool,
-    max_lag_step_a: Optional[int],
-) -> str:
-    payload = {
-        "coverage_threshold": coverage_threshold,
-        "min_tickers": min_tickers,
-        "min_rows_per_day": min_rows_per_day,
-        "min_rows_after_clean": min_rows_after_clean,
-        "band": band,
-        "top_k": top_k,
-        "max_pairs_prefilter": max_pairs_prefilter,
-        "require_nonzero_lag": require_nonzero_lag,
-        "max_lag_step_a": max_lag_step_a,
-    }
-    return json.dumps(payload, sort_keys=True)
-
-
-def _checkpoint_paths(checkpoint_path: str) -> Tuple[Path, Path]:
-    p = Path(checkpoint_path)
-    meta = p.with_suffix(p.suffix + ".meta.json")
-    return p, meta
-
-
-def load_checkpoint_done_dates(checkpoint_path: str) -> Tuple[set, Optional[str]]:
-    """
-    Returns:
-      done_dates: set of formation_date strings already saved
-      saved_signature: signature string (or None if not present)
-    """
-    p, meta = _checkpoint_paths(checkpoint_path)
-
-    done_dates = set()
-    saved_signature = None
-
-    if p.exists():
-        df = pl.read_parquet(str(p), columns=["formation_date"])
-        done_dates = set(df.get_column("formation_date").to_list())
-
-    if meta.exists():
-        try:
-            saved_signature = json.loads(meta.read_text(encoding="utf-8")).get("signature")
-        except Exception:
-            saved_signature = None
-
-    return done_dates, saved_signature
-
-
-def write_checkpoint_metadata(checkpoint_path: str, signature: str) -> None:
-    _, meta = _checkpoint_paths(checkpoint_path)
-    meta.parent.mkdir(parents=True, exist_ok=True)
-    meta.write_text(json.dumps({"signature": signature}, indent=2), encoding="utf-8")
-
-
-def append_checkpoint_rows(checkpoint_path: str, rows_df: pl.DataFrame) -> None:
-    """
-    Append rows to a parquet checkpoint (safe, simple, good for top_k/day).
-
-    Implementation:
-      - if file doesn't exist: write it
-      - else: read existing + concat + write tmp + atomic replace
-    """
-    p, _ = _checkpoint_paths(checkpoint_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-
-    if not p.exists():
-        rows_df.write_parquet(str(p))
-        return
-
-    existing = pl.read_parquet(str(p))
-    combined = pl.concat([existing, rows_df], how="vertical")
-
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    combined.write_parquet(str(tmp))
-    os.replace(str(tmp), str(p))
-
-
-def load_full_checkpoint(checkpoint_path: str) -> pl.DataFrame:
-    """Load the entire checkpoint parquet (if it exists)."""
-    p, _ = _checkpoint_paths(checkpoint_path)
-    if not p.exists():
-        return pl.DataFrame()
-    return pl.read_parquet(str(p))
-
-
-# ============================================================
-# Full daily pipeline (with checkpointing)
-# ============================================================
-
-def run_daily_ocp_pipeline(
-    panel: pl.DataFrame,
-    tickers: List[str],
-    coverage_threshold: float = 0.99,
-    min_tickers: int = 20,
-    min_rows_per_day: int = 300,
-    min_rows_after_clean: int = 300,
-    band: int = 30,
-    top_k: int = 10,
-    max_pairs_prefilter: int = 500,
-    require_nonzero_lag: bool = True,
-    max_lag_step_a: Optional[int] = None,
-    verbose: bool = True,
-    checkpoint_path: Optional[str] = None,
-    resume: bool = True,
-) -> pl.DataFrame:
-    """
-    End-to-end daily loop:
-
-    For each formation day d and the next trading day d+1:
-      - formation slice is [start_d, start_{d+1})
-      - coverage filter tickers
-      - drop any null rows (dense formation window)
-      - optionally prefilter pairs by |corr|
-      - run OCP and keep top_k stable pairs
-
-    If checkpoint_path is set:
-      - append top_k results after each day
-      - if resume=True, skip formation dates already present in checkpoint
-      - verify a run signature to prevent resuming with changed parameters
-
-    Returns:
-      DataFrame of results computed in THIS run (not necessarily the full checkpoint).
-      Use load_full_checkpoint(checkpoint_path) to get all saved results.
-    """
-    logger.setLevel(logging.INFO if verbose else logging.WARNING)
-
-    sig = _run_signature(
-        coverage_threshold=coverage_threshold,
-        min_tickers=min_tickers,
-        min_rows_per_day=min_rows_per_day,
-        min_rows_after_clean=min_rows_after_clean,
-        band=band,
-        top_k=top_k,
-        max_pairs_prefilter=max_pairs_prefilter,
-        require_nonzero_lag=require_nonzero_lag,
-        max_lag_step_a=max_lag_step_a,
-    )
-
-    done_dates = set()
-    saved_sig = None
-    if checkpoint_path is not None and resume:
-        done_dates, saved_sig = load_checkpoint_done_dates(checkpoint_path)
-        if saved_sig is not None and saved_sig != sig:
-            raise ValueError(
-                "Checkpoint exists but parameters changed.\n"
-                "Delete the checkpoint or use a new checkpoint_path."
-            )
-        if saved_sig is None:
-            write_checkpoint_metadata(checkpoint_path, sig)
-        if done_dates and verbose:
-            logger.info(f"Checkpoint resume: {len(done_dates)} formation days already done. Skipping them.")
-
-    days = build_trading_days(panel).filter(pl.col("n_rows") >= min_rows_per_day).sort("date")
-    if days.height < 2:
-        raise ValueError("Not enough valid trading days (need at least 2).")
-
-    date_list = days.get_column("date").to_list()
-    start_list = days.get_column("start_ts").to_list()
-
-    run_results: List[OCPResult] = []
-
-    for i in range(days.height - 1):
-        formation_date = str(date_list[i])
-        start_ts = start_list[i]
-        end_ts = start_list[i + 1]
-
-        if checkpoint_path is not None and resume and formation_date in done_dates:
-            continue
-
-        try:
-            w_dense, kept_tickers, stats = prepare_formation_window(
-                panel=panel,
-                tickers=tickers,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                coverage_threshold=coverage_threshold,
-                min_tickers=min_tickers,
-                min_rows=min_rows_after_clean,
-            )
-        except Exception as e:
-            logger.warning(f"[{formation_date}] skipped (formation window prep failed): {e}")
-            continue
-
-        if verbose:
-            logger.info(
-                f"[{formation_date}] formation window: rows {stats.rows_before}->{stats.rows_after} "
-                f"(dropped {stats.dropped_rows}), tickers {stats.tickers_before}->{stats.tickers_after}"
-            )
-
-        arrays = extract_arrays_from_window(w_dense, kept_tickers)
-
-        if max_pairs_prefilter and max_pairs_prefilter > 0:
-            pairs = prefilter_pairs_by_abs_corr(w_dense, kept_tickers, max_pairs=max_pairs_prefilter)
-            if verbose:
-                logger.info(f"[{formation_date}] prefilter pairs: keeping {len(pairs)} pairs by |corr|")
-        else:
-            pairs = generate_ticker_pairs(kept_tickers)
-            if verbose:
-                logger.info(f"[{formation_date}] using all pairs: {len(pairs)}")
-
-        top = run_ocp_on_pairs(
-            arrays_by_ticker=arrays,
-            pairs=pairs,
-            formation_date=formation_date,
+    for pair in pairs:
+        r = ocp_pair(
+            day_matrix=day_matrix,
+            pair=pair,
+            max_lag=max_lag,
             band=band,
-            top_k=top_k,
-            require_nonzero_lag=require_nonzero_lag,
-            max_lag_step_a=max_lag_step_a,
-            window_rows_used=w_dense.height,
+            min_abs_lag=min_abs_lag,
+            max_sigma=max_sigma,
         )
+        if r is not None:
+            results.append(r)
 
-        # Day results -> DataFrame for checkpoint append
-        day_df = pl.DataFrame(
-            {
-                "formation_date": [r.formation_date for r in top],
-                "leader": [r.leader for r in top],
-                "follower": [r.follower for r in top],
-                "lag_initial": [r.lag_initial for r in top],
-                "lag_hat": [r.lag_hat for r in top],
-                "sigma_lag": [r.sigma_lag for r in top],
-                "cost": [r.cost for r in top],
-                "path_len": [r.path_len for r in top],
-                "band": [r.band for r in top],
-                "window_rows_used": [r.window_rows_used for r in top],
-            }
-        )
+    if not results:
+        return pd.DataFrame(columns=["leader", "follower", "l_hat", "sigma_l", "cost", "path_len"])
 
-        if checkpoint_path is not None:
-            append_checkpoint_rows(checkpoint_path, day_df)
-            if verbose:
-                logger.info(f"[{formation_date}] checkpoint saved: {len(top)} rows -> {checkpoint_path}")
-
-        run_results.extend(top)
-
-    # Return DF for this run
-    if not run_results:
-        return pl.DataFrame(
-            schema={
-                "formation_date": pl.Utf8,
-                "leader": pl.Utf8,
-                "follower": pl.Utf8,
-                "lag_initial": pl.Int32,
-                "lag_hat": pl.Float64,
-                "sigma_lag": pl.Float64,
-                "cost": pl.Float64,
-                "path_len": pl.Int32,
-                "band": pl.Int32,
-                "window_rows_used": pl.Int32,
-            }
-        )
-
-    df = pl.DataFrame(
-        {
-            "formation_date": [r.formation_date for r in run_results],
-            "leader": [r.leader for r in run_results],
-            "follower": [r.follower for r in run_results],
-            "lag_initial": [r.lag_initial for r in run_results],
-            "lag_hat": [r.lag_hat for r in run_results],
-            "sigma_lag": [r.sigma_lag for r in run_results],
-            "cost": [r.cost for r in run_results],
-            "path_len": [r.path_len for r in run_results],
-            "band": [r.band for r in run_results],
-            "window_rows_used": [r.window_rows_used for r in run_results],
-        }
-    ).sort(["formation_date", "sigma_lag"])
-
+    df = pd.DataFrame([r.__dict__ for r in results])
+    df = df.sort_values(["sigma_l", "cost"], ascending=[True, True]).head(top_k).reset_index(drop=True)
     return df
 
+def ocp_top_pairs_for_day_fast(day_matrix, day_pair, top_k=10, max_lag=30, band=10, keep_top_pairs: Optional[int] = None) -> pd.DataFrame:
+    
+    if keep_top_pairs is None:
+        pairs = day_pair
+    else:
+        pairs = prefilter_pairs_by_xcorr(day_matrix, max_lag=max_lag, keep_top_k=keep_top_pairs)
 
-# ============================================================
-# Example (commented)
-# ============================================================
+    rows = []
+    for p in pairs:
+        r = ocp_pair_fast(day_matrix, p, max_lag=max_lag, band=band)
+        if r is not None:
+            rows.append(r)
 
-# results_df = run_daily_ocp_pipeline(
-#     panel=panel,
-#     tickers=tickers,
-#     band=30,
-#     max_pairs_prefilter=500,
-#     top_k=10,
-#     checkpoint_path="checkpoints/ocp_daily.parquet",
-#     resume=True,
-# )
-# full_df = load_full_checkpoint("checkpoints/ocp_daily.parquet")
+    if not rows:
+        return pd.DataFrame(columns=["leader","follower","l_hat","sigma_l","cost"])
+
+    df = pd.DataFrame(rows, columns=["leader","follower","l_hat","sigma_l","cost"])
+    return df.sort_values(["sigma_l","cost"]).head(top_k).reset_index(drop=True)
+
+
+
+
+def ocp_run_all_days_fast(
+    daily_matrices: Dict,
+    daily_pairs: Dict,
+    keep_top_pairs: int = 400,
+    top_k: int = 10,
+    max_lag: int = 30,
+    band: int = 10,
+    first_n_days: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Runs OCP top pairs for every day in daily_matrices and returns one long table.
+
+    Args:
+        first_n_days: if provided, run only on the first N days (chronologically).
+    """
+    rows = []
+
+    days = sorted(daily_matrices.keys())
+    if first_n_days is not None:
+        if first_n_days <= 0:
+            return pd.DataFrame(columns=["date", "leader", "follower", "l_hat", "sigma_l", "cost", "path_len"])
+        days = days[:first_n_days]
+
+    for day in tqdm(days):
+        day_matrix = daily_matrices[day]
+        pairs = daily_pairs.get(day, [])
+        if len(pairs) == 0:
+            continue
+
+        top_df = ocp_top_pairs_for_day_fast(
+            day_matrix=day_matrix,
+            top_k=top_k,
+            day_pair=pairs,
+            keep_top_pairs=keep_top_pairs,
+            max_lag=max_lag,
+            band=band,
+        )
+        if top_df.empty:
+            continue
+
+        top_df.insert(0, "date", day)
+        rows.append(top_df)
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "leader", "follower", "l_hat", "sigma_l", "cost", "path_len"])
+
+    return pd.concat(rows, ignore_index=True)
